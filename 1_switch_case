@@ -1,0 +1,147 @@
+// 1 способ
+// пины
+const int PIN_RED = 13;
+const int PIN_YELLOW = 12;
+const int PIN_GREEN = 11;
+
+const int PIN_PED = 2;        
+const int PIN_EMER = 3;      
+
+// таймеры, интервалы
+const unsigned long T_GREEN = 10000UL; // зел
+const unsigned long T_YELLOW = 3000UL; // желт 
+const unsigned long T_RED = 10000UL; // красн 
+const unsigned long T_PED_EXTRA = 5000UL;     // доп время 
+const unsigned long BLINK_EMERGENCY = 500UL;   // интервал аварийный
+const unsigned long BLINK_NIGHT = 1000UL;      // интервал ночной
+
+
+const unsigned long DEBOUNCE_MS = 50UL; // против дребезга
+const unsigned long LONG_PRESS_MS = 4000UL;  // для ночного длинное нажатие
+const unsigned long DOUBLE_CLICK_WINDOW_MS = 500UL; // окно для нажатия 
+
+
+// возможные состояния 
+enum State { S_GREEN, S_YELLOW, S_RED, S_WARNING }; 
+enum Event { E_NONE, E_TIMER_EXPIRE, E_PED_REQ, E_EMERGENCY_ON, E_EMERGENCY_OFF, E_NIGHT_TOGGLE };
+
+// текущее состояние
+State currentState = S_GREEN;
+unsigned long stateStartMs = 0;
+unsigned long stateDuration = 0;
+
+
+typedef void (*HandlerFn)(void);
+const int NUM_STATES = 4;
+const int NUM_EVENTS = 6;
+HandlerFn fsmTable[NUM_STATES][NUM_EVENTS];
+
+// флаги 
+bool pedRequested = false;  
+bool emergencyActive = false;
+bool nightModeActive = false;
+
+
+State savedState = S_GREEN;
+unsigned long savedRemainingMs = 0;
+
+unsigned long lastBlinkToggle = 0;
+unsigned long blinkInterval = BLINK_EMERGENCY;
+bool yellowOnDuringBlink = false;
+
+int lastRawPed = HIGH;
+unsigned long lastDebouncePed = 0;
+unsigned long pedPressStart = 0;
+unsigned long lastShortRelease = 0;
+bool waitForSecondPress = false;
+
+int lastRawEmer = HIGH;
+unsigned long lastDebounceEmer = 0;
+
+
+void setOutputsForState(State s) { // выключаем все 
+  digitalWrite(PIN_RED, LOW);
+  digitalWrite(PIN_YELLOW, LOW);
+  digitalWrite(PIN_GREEN, LOW);
+
+  if (s == S_GREEN) digitalWrite(PIN_GREEN, HIGH); // включаем только нужный
+  else if (s == S_YELLOW) digitalWrite(PIN_YELLOW, HIGH);
+  else if (s == S_RED) digitalWrite(PIN_RED, HIGH);
+}
+
+void goToState(State s, unsigned long dur) {
+  currentState = s;
+  stateStartMs = millis();
+  stateDuration = dur;
+  if (s != S_WARNING) {
+    setOutputsForState(s);
+    yellowOnDuringBlink = false;
+  } else {
+    digitalWrite(PIN_RED, LOW);
+    digitalWrite(PIN_GREEN, LOW);
+    digitalWrite(PIN_YELLOW, LOW);
+    lastBlinkToggle = millis();
+  }
+
+  Serial.print("Transition -> ");
+  switch (s) {
+    case S_GREEN: Serial.print("S_GREEN"); break;
+    case S_YELLOW: Serial.print("S_YELLOW"); break;
+    case S_RED: Serial.print("S_RED"); break;
+    case S_WARNING: Serial.print("S_WARNING"); break;
+  }
+  Serial.print("  dur(ms)="); Serial.println(dur);
+}
+
+
+
+void saveStateForInterrupt() {
+  savedState = currentState;
+  unsigned long elapsed = millis() - stateStartMs;
+  if (elapsed >= stateDuration) savedRemainingMs = 0;
+  else savedRemainingMs = stateDuration - elapsed;
+}
+
+
+void restoreSavedState() {
+  if (savedRemainingMs > 50) {
+    goToState(savedState, savedRemainingMs);
+  } else {
+    if (savedState == S_GREEN) goToState(S_GREEN, T_GREEN);
+    else if (savedState == S_YELLOW) goToState(S_YELLOW, T_YELLOW);
+    else goToState(S_RED, T_RED);
+  }
+}
+
+// обработка событий
+void handleTimerGreen() {
+  if (pedRequested) Serial.println("Timer: GREEN expired (ped requested)");
+  goToState(S_YELLOW, T_YELLOW);
+}
+
+void handleTimerYellow() {
+  if (pedRequested) {
+    pedRequested = false;
+    Serial.println("Timer: YELLOW expired -> RED extended for pedestrian");
+    goToState(S_RED, T_RED + T_PED_EXTRA);
+  } else {
+    Serial.println("Timer: YELLOW expired -> RED normal");
+    goToState(S_RED, T_RED);
+  }
+}
+
+void handleTimerRed() {
+  Serial.println("Timer: RED expired -> GREEN");
+  goToState(S_GREEN, T_GREEN);
+}
+
+void handleEmergencyOn() {
+  if (!emergencyActive) {
+    Serial.println("Event: EMERGENCY ON");
+    emergencyActive = true;
+    nightModeActive = false;
+    saveStateForInterrupt();
+    blinkInterval = BLINK_EMERGENCY;
+    goToState(S_WARNING, 0); 
+  }
+}
