@@ -1,0 +1,164 @@
+// пины
+const int PIN_RED = 13;
+const int PIN_YELLOW = 12;
+const int PIN_GREEN = 11;
+
+const int PIN_PED = 2;    // пешеходная кнопка
+const int PIN_EMER = 3;   // аварийная кнопка
+
+
+const unsigned long T_GREEN = 10000;
+const unsigned long T_YELLOW = 3000;
+const unsigned long T_RED = 10000;
+const unsigned long T_PED_EXTRA = 5000;
+const unsigned long BLINK_EMER = 500;
+const unsigned long BLINK_NIGHT = 1000;
+const unsigned long DEBOUNCE_MS = 50;
+const unsigned long LONG_PRESS_MS = 2000;
+
+// состояния
+enum State { S_GREEN, S_YELLOW, S_RED, S_WARNING, NUM_STATES };
+enum Event { E_NONE, E_TIMER, E_PED, E_EMERGENCY_ON, E_EMERGENCY_OFF, E_NIGHT_TOGGLE, NUM_EVENTS };
+
+State currentState = S_GREEN;
+unsigned long stateStart = 0;
+unsigned long stateDur = 0;
+
+// флаги 
+bool pedRequest = false;
+bool emergency = false;
+bool nightMode = false;
+
+// таблица
+typedef void (*Handler)(void);
+Handler fsmTable[NUM_STATES][NUM_EVENTS];
+
+// для мигания
+unsigned long lastBlink = 0;
+bool blinkOn = false;
+
+// debounce педкнопки
+bool lastPedState = HIGH;
+unsigned long lastPedChange = 0;
+unsigned long pedPressStart = 0;
+
+// debounce аварийной кнопки
+bool lastEmerState = HIGH;
+unsigned long lastEmerChange = 0;
+
+// вспомогательные 
+void setOutputs(State s) {
+  digitalWrite(PIN_RED, LOW);
+  digitalWrite(PIN_YELLOW, LOW);
+  digitalWrite(PIN_GREEN, LOW);
+
+  if (s == S_GREEN) digitalWrite(PIN_GREEN, HIGH);
+  if (s == S_YELLOW) digitalWrite(PIN_YELLOW, HIGH);
+  if (s == S_RED) digitalWrite(PIN_RED, HIGH);
+  // WARNING обрабатывается отдельно
+}
+
+void goTo(State s, unsigned long dur) {
+  currentState = s;
+  stateDur = dur;
+  stateStart = millis();
+  setOutputs(s);
+  Serial.print("Transition to ");
+  Serial.print(s);
+  Serial.print(" for ");
+  Serial.print(dur);
+  Serial.println(" ms");
+}
+
+// обработчики
+void onGreenTimer() { goTo(S_YELLOW, T_YELLOW); }
+
+void onYellowTimer() {
+  if (pedRequest) {
+    pedRequest = false;
+    goTo(S_RED, T_RED + T_PED_EXTRA);
+  } else {
+    goTo(S_RED, T_RED);
+  }
+}
+
+void onRedTimer() { goTo(S_GREEN, T_GREEN); }
+
+void onEmergencyOn() {
+  emergency = true;
+  goTo(S_WARNING, BLINK_EMER);
+}
+
+void onEmergencyOff() {
+  emergency = false;
+  goTo(S_RED, T_RED); 
+}
+
+void onNightToggle() {
+  nightMode = !nightMode;
+  if (nightMode) goTo(S_WARNING, BLINK_NIGHT);
+  else goTo(S_GREEN, T_GREEN);
+}
+
+void onPedReq() {
+  if (!emergency && !nightMode) {
+    pedRequest = true;
+    Serial.println("Pedestrian request accepted");
+  } else {
+    Serial.println("Pedestrian request ignored");
+  }
+}
+
+// таблица
+void setupTable() {
+  for (int s = 0; s < NUM_STATES; s++)
+    for (int e = 0; e < NUM_EVENTS; e++)
+      fsmTable[s][e] = NULL;
+
+  fsmTable[S_GREEN][E_TIMER] = onGreenTimer;
+  fsmTable[S_YELLOW][E_TIMER] = onYellowTimer;
+  fsmTable[S_RED][E_TIMER] = onRedTimer;
+
+  for (int s = 0; s < NUM_STATES; s++) {
+    fsmTable[s][E_EMERGENCY_ON] = onEmergencyOn;
+    fsmTable[s][E_EMERGENCY_OFF] = onEmergencyOff;
+    fsmTable[s][E_NIGHT_TOGGLE] = onNightToggle;
+    fsmTable[s][E_PED] = onPedReq;
+  }
+}
+
+// события
+Event pollEvent() {
+  unsigned long now = millis();
+
+  // педкнопка
+  bool ped = digitalRead(PIN_PED);
+  if (ped != lastPedState && now - lastPedChange > DEBOUNCE_MS) {
+    lastPedChange = now;
+    lastPedState = ped;
+
+
+if (ped == LOW) pedPressStart = now;
+    if (ped == HIGH && pedPressStart > 0) {
+      unsigned long pressDur = now - pedPressStart;
+      pedPressStart = 0;
+      if (pressDur > LONG_PRESS_MS) return E_NIGHT_TOGGLE;
+      else return E_PED;
+    }
+  }
+
+  // аварийка
+  bool emer = digitalRead(PIN_EMER);
+  if (emer != lastEmerState && now - lastEmerChange > DEBOUNCE_MS) {
+    lastEmerChange = now;
+    lastEmerState = emer;
+
+    if (emer == LOW) return E_EMERGENCY_ON;
+    if (emer == HIGH) return E_EMERGENCY_OFF;
+  }
+
+  // таймер
+  if (currentState != S_WARNING && now - stateStart >= stateDur) return E_TIMER;
+
+  return E_NONE;
+}
